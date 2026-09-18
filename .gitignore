@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.install-state/
+.DS_Store
