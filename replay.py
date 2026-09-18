@@ -4,15 +4,22 @@
 宿主无关：任何 agent 经 shell 调用。数据存在全局数据家（默认 ~/.replay/，
 环境变量 REPLAY_HOME 可覆盖），不按项目分库；项目只是记录里的一个字段。
 
+扁平记录与发现树共存：不加树字段的记录照旧扁平（服务小循环回放表）；
+探索型任务可 tree-begin 开树、tree-add 挂节点，攒出的树形历史直接服务③④层
+（图纸：docs/dream-layer-design.md）。
+
 用法：
   python replay.py init
-  python replay.py log --task "..." --archetype "..." --outcome success|fail|mixed [选项]
+  python replay.py log --task "..." --archetype "..." --outcome success|fail|mixed [选项] [--rollout R --parent N]
   python replay.py query <关键词...>
   python replay.py board [关键词...]     # 回放表：动手前先看历史上最近似的尝试
   python replay.py stats
+  python replay.py gate                  # 进化闸门：扁平覆盖 / 树形带分数两级判定
   python replay.py eval-set <原型> --run "命令" [--score-regex "正则" | --score-mode exitcode|elapsed|filesize:路径] --better higher|lower
   python replay.py eval --archetype <原型> --task "..." [--approach "..."]   # 自动跑分并入账
   python replay.py evals
+  python replay.py tree-begin --archetype "..." --task "..."               # 开一棵发现树（rollout）
+  python replay.py tree-add --rollout R --archetype "..." --task "..." [--parent N]  # 挂节点，有评估器则自动跑分
 """
 import argparse
 import json
@@ -24,7 +31,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-FIELDS_TEXT = ["task", "archetype", "approach", "evaluator", "note", "death"]
+# 做梦层开火闸门：覆盖度不够时进化 = 追噪声。阈值是合同不是物理——被实测推翻就改。
+GATE = {"attempts": 8, "approaches": 2, "scored": 4}
+# 做梦的门槛（论文 t=1 即可做梦，本地取保守值）：树形且带分数的记录数。
+TREE_GATE = 4
+DESIGN_DOC = "dream-ledger 仓库 docs/dream-layer-design.md"
 
 
 def home():
@@ -33,6 +44,10 @@ def home():
 
 def ledger_path():
     return os.path.join(home(), "ledger.jsonl")
+
+
+def rollouts_path():
+    return os.path.join(home(), "rollouts.jsonl")
 
 
 def load():
@@ -48,12 +63,47 @@ def load():
     return out
 
 
-def cmd_init(_):
-    os.makedirs(home(), exist_ok=True)
-    if not os.path.exists(ledger_path()):
-        open(ledger_path(), "a", encoding="utf-8").close()
-    print("账本家: %s" % ledger_path())
-    print("记录数: %d" % len(load()))
+def load_rollouts():
+    p = rollouts_path()
+    if not os.path.exists(p):
+        return {}
+    out = {}
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                out[r["rollout"]] = r
+    return out
+
+
+def gate_gaps(rs):
+    attempts = len(rs)
+    approaches = len({r["approach"] for r in rs if r["approach"]})
+    scored = sum(1 for r in rs if r["score"])
+    gaps = []
+    if attempts < GATE["attempts"]:
+        gaps.append("尝试数 %d/%d" % (attempts, GATE["attempts"]))
+    if approaches < GATE["approaches"]:
+        gaps.append("不同做法 %d/%d" % (approaches, GATE["approaches"]))
+    if scored < GATE["scored"]:
+        gaps.append("带分数 %d/%d" % (scored, GATE["scored"]))
+    return gaps
+
+
+def tree_scored(rs):
+    return sum(1 for r in rs if r.get("rollout") and r.get("score"))
+
+
+def gate_verdict(name, rs):
+    """两级判定：扁平覆盖满格 → 可开树模式探索；树形带分数满格 → 可做梦。"""
+    ts = tree_scored(rs)
+    if ts >= TREE_GATE:
+        return "【可做梦】树形带分数 %d/%d 已满格——按图纸执行：%s" % (ts, TREE_GATE, DESIGN_DOC)
+    gaps = gate_gaps(rs)
+    if gaps:
+        return "不可进化（覆盖不足：%s；树形带分数 %d/%d）" % ("、".join(gaps), ts, TREE_GATE)
+    return "【可开树】扁平覆盖达标（树形带分数 %d/%d）——按图纸开树探索：%s" % (ts, TREE_GATE, DESIGN_DOC)
 
 
 def write_rec(rec):
@@ -63,9 +113,9 @@ def write_rec(rec):
     print("已入账 %s（%s / %s / %s）" % (rec["id"], rec["archetype"], rec["outcome"], rec["ts"][:10]))
     # 检测全自动：每次入账当场检查该原型覆盖度，达标即喊（开火与否仍走闸门）
     rs = [r for r in load() if r["archetype"] == rec["archetype"]]
-    if not gate_gaps(rs):
-        print("【可进化】原型「%s」覆盖达标（%d 条尝试）——图纸：dream-ledger 仓库 docs/dream-layer-design.md；第一次开火先问用户。" % (
-            rec["archetype"], len(rs)))
+    verdict = gate_verdict(rec["archetype"], rs)
+    if verdict.startswith("【"):
+        print("%s（原型「%s」）" % (verdict, rec["archetype"]))
 
 
 def new_rec(task, archetype, outcome, project="", approach="", evaluator="",
@@ -80,13 +130,36 @@ def new_rec(task, archetype, outcome, project="", approach="", evaluator="",
     }
 
 
+def apply_tree(a, rec):
+    """可选树字段：给了 --rollout 就把记录挂成树节点（seq 自动，parent 默认 root）。"""
+    rollout = getattr(a, "rollout", "") or ""
+    if not rollout:
+        return rec
+    known = load_rollouts()
+    if rollout not in known:
+        print("WARN: rollout「%s」未登记（先 tree-begin 开树）；仍按树节点入账" % rollout, file=sys.stderr)
+    rec["rollout"] = rollout
+    rec["parent"] = (getattr(a, "parent", "") or "") or "root"
+    rec["seq"] = 1 + sum(1 for r in load() if r.get("rollout") == rollout)
+    return rec
+
+
+def cmd_init(_):
+    os.makedirs(home(), exist_ok=True)
+    if not os.path.exists(ledger_path()):
+        open(ledger_path(), "a", encoding="utf-8").close()
+    print("账本家: %s" % ledger_path())
+    print("记录数: %d" % len(load()))
+
+
 def cmd_log(a):
     if a.outcome not in ("success", "fail", "mixed"):
         print("ERROR: --outcome 只能是 success / fail / mixed", file=sys.stderr)
         return 1
-    write_rec(new_rec(a.task, a.archetype, a.outcome, a.project or "", a.approach or "",
-                      a.evaluator or "", a.score or "", a.cost or "", a.death or "",
-                      a.evidence or "", a.note or ""))
+    rec = new_rec(a.task, a.archetype, a.outcome, a.project or "", a.approach or "",
+                  a.evaluator or "", a.score or "", a.cost or "", a.death or "",
+                  a.evidence or "", a.note or "")
+    write_rec(apply_tree(a, rec))
     return 0
 
 
@@ -96,9 +169,10 @@ def match(rec, kws):
 
 
 def fmt_row(r):
-    return "%s | %s | %s | %s | %s | %s%s" % (
+    tree = " [%s#%s←%s]" % (r["rollout"], r["seq"], r["parent"]) if r.get("rollout") else ""
+    return "%s | %s | %s | %s | %s | %s%s%s" % (
         r["ts"][:10], r["project"] or "-", r["archetype"], r["approach"][:40] or "-",
-        r["outcome"], r["score"], (" | 死因: " + r["death"]) if r["death"] else "")
+        r["outcome"], r["score"], tree, (" | 死因: " + r["death"]) if r["death"] else "")
 
 
 def cmd_query(a):
@@ -130,24 +204,6 @@ def cmd_board(a):
     return 0
 
 
-# 做梦层开火闸门：覆盖度不够时进化 = 追噪声。阈值是合同不是物理——被实测推翻就改。
-GATE = {"attempts": 8, "approaches": 2, "scored": 4}
-
-
-def gate_gaps(rs):
-    attempts = len(rs)
-    approaches = len({r["approach"] for r in rs if r["approach"]})
-    scored = sum(1 for r in rs if r["score"])
-    gaps = []
-    if attempts < GATE["attempts"]:
-        gaps.append("尝试数 %d/%d" % (attempts, GATE["attempts"]))
-    if approaches < GATE["approaches"]:
-        gaps.append("不同做法 %d/%d" % (approaches, GATE["approaches"]))
-    if scored < GATE["scored"]:
-        gaps.append("带分数 %d/%d" % (scored, GATE["scored"]))
-    return gaps
-
-
 def cmd_gate(_):
     recs = load()
     by_a = {}
@@ -157,22 +213,24 @@ def cmd_gate(_):
         print("账本为空，无原型可评估")
         return 0
     for name, rs in sorted(by_a.items()):
-        gaps = gate_gaps(rs)
-        verdict = "不可进化（覆盖不足：%s）" % "、".join(gaps) if gaps else "可进化——覆盖达标；图纸见 dream-ledger 仓库 docs/dream-layer-design.md"
-        print("%s: %s" % (name, verdict))
+        print("%s: %s" % (name, gate_verdict(name, rs)))
     return 0
 
 
 def cmd_stats(_):
     recs = load()
     by_a, by_p = {}, {}
+    tree = 0
     for r in recs:
         by_a[r["archetype"]] = by_a.get(r["archetype"], 0) + 1
         if r["project"]:
             by_p[r["project"]] = by_p.get(r["project"], 0) + 1
-    print("账本总条数: %d" % len(recs))
+        if r.get("rollout"):
+            tree += 1
+    print("账本总条数: %d（树形 %d 条）" % (len(recs), tree))
     print("按原型: " + (", ".join("%s×%d" % kv for kv in sorted(by_a.items())) or "（空）"))
     print("按项目: " + (", ".join("%s×%d" % kv for kv in sorted(by_p.items())) or "（空）"))
+    print("发现树: %d 棵" % len(load_rollouts()))
     return 0
 
 
@@ -227,17 +285,12 @@ def extract_score(entry, out, rc, elapsed):
     return None
 
 
-def cmd_eval(a):
-    """全自动评估：跑登记的打分器 → 抠分数 → 连同耗时/死因自动入账。"""
-    entry = load_evaluators().get(a.archetype)
-    if not entry:
-        print("ERROR: 原型「%s」未登记评估器。先 eval-set 登记，或退回手动 log。" % a.archetype,
-              file=sys.stderr)
-        return 1
+def run_evaluator(entry, cwd=None):
+    """跑登记的打分器，返回 (outcome, score_str, score_value, cost, death, diagnostics)。"""
     t0 = time.monotonic()
     death = ""
     try:
-        r = subprocess.run(entry["run"], shell=True, cwd=a.cwd or entry.get("cwd") or None,
+        r = subprocess.run(entry["run"], shell=True, cwd=cwd or entry.get("cwd") or None,
                            timeout=entry.get("timeout", 600), capture_output=True,
                            text=True, encoding="utf-8", errors="replace")
         rc, out = r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -256,16 +309,76 @@ def cmd_eval(a):
         death = "命令成功但分数未抠到（检查 score 配置是否匹配输出）"
     else:
         outcome = "success"
-    if a.outcome:
-        outcome = a.outcome
     score_str = ""
     if score is not None:
         score_str = "%s（%s）" % (score, "越大越好" if entry["better"] == "higher" else "越小越好")
-    write_rec(new_rec(a.task, a.archetype, outcome, a.project or "", a.approach or "",
-                      entry["run"], score_str, "wall %.1fs" % elapsed, death,
-                      a.evidence or "", a.note or ""))
-    print("评估完成: outcome=%s score=%s 耗时=%.1fs" % (outcome, score or "（未抠到）", elapsed))
+    score_value = None
+    if score is not None:
+        try:
+            score_value = float(score)
+        except ValueError:
+            score_value = None
+    tail = out.strip().splitlines()
+    diagnostics = tail[-1][:120] if tail else ""
+    return outcome, score_str, score_value, "wall %.1fs" % elapsed, death, diagnostics
+
+
+def cmd_eval(a):
+    """全自动评估：跑登记的打分器 → 抠分数 → 连同耗时/死因自动入账。"""
+    entry = load_evaluators().get(a.archetype)
+    if not entry:
+        print("ERROR: 原型「%s」未登记评估器。先 eval-set 登记，或退回手动 log。" % a.archetype,
+              file=sys.stderr)
+        return 1
+    outcome, score_str, score_value, cost, death, diag = run_evaluator(entry, a.cwd)
+    if a.outcome:
+        outcome = a.outcome
+    rec = new_rec(a.task, a.archetype, outcome, a.project or "", a.approach or "",
+                  entry["run"], score_str, cost, death, a.evidence or "", a.note or "")
+    if score_value is not None:
+        rec["score_value"] = score_value
+        rec["diagnostics"] = diag
+    write_rec(apply_tree(a, rec))
+    print("评估完成: outcome=%s score=%s" % (outcome, score_str or "（未抠到）"))
     return 0 if outcome != "fail" else 1
+
+
+def cmd_tree_begin(a):
+    rollout = "r" + uuid.uuid4().hex[:6]
+    rec = {"rollout": rollout, "archetype": a.archetype, "task": a.task,
+           "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")}
+    os.makedirs(home(), exist_ok=True)
+    with open(rollouts_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print("已开树 %s（原型 %s）。后续每次尝试：tree-add --rollout %s --parent <节点id或root>" % (
+        rollout, a.archetype, rollout))
+    return 0
+
+
+def cmd_tree_add(a):
+    """往发现树挂一个节点；原型有登记评估器则自动跑分，否则按手动字段入账。"""
+    entry = load_evaluators().get(a.archetype)
+    if entry and not a.manual:
+        outcome, score_str, score_value, cost, death, diag = run_evaluator(entry, a.cwd)
+        rec = new_rec(a.task, a.archetype, outcome, a.project or "", a.approach or "",
+                      entry["run"], score_str, cost, death, a.evidence or "", a.note or "")
+        if score_value is not None:
+            rec["score_value"] = score_value
+            rec["diagnostics"] = diag
+    else:
+        if a.outcome not in ("success", "fail", "mixed", None):
+            print("ERROR: --outcome 只能是 success / fail / mixed", file=sys.stderr)
+            return 1
+        if not a.outcome:
+            print("ERROR: 原型「%s」未登记评估器，手动挂节点必须给 --outcome" % a.archetype,
+                  file=sys.stderr)
+            return 1
+        rec = new_rec(a.task, a.archetype, a.outcome, a.project or "", a.approach or "",
+                      "", a.score or "", a.cost or "", a.death or "", a.evidence or "", a.note or "")
+    write_rec(apply_tree(a, rec))
+    print("挂树完成: rollout=%s seq=%s parent=%s outcome=%s score=%s" % (
+        rec["rollout"], rec["seq"], rec["parent"], rec["outcome"], rec["score"] or "（无）"))
+    return 0 if rec["outcome"] != "fail" else 1
 
 
 def main():
@@ -279,6 +392,7 @@ def main():
     lp.add_argument("--project"), lp.add_argument("--approach"), lp.add_argument("--evaluator")
     lp.add_argument("--score"), lp.add_argument("--cost"), lp.add_argument("--death")
     lp.add_argument("--evidence"), lp.add_argument("--note")
+    lp.add_argument("--rollout"), lp.add_argument("--parent")
     for name in ("query", "board"):
         p = sub.add_parser(name)
         p.add_argument("kw", nargs="*")
@@ -299,11 +413,26 @@ def main():
     ep.add_argument("--approach"), ep.add_argument("--project"), ep.add_argument("--note")
     ep.add_argument("--evidence"), ep.add_argument("--cwd")
     ep.add_argument("--outcome", choices=["success", "fail", "mixed"], help="覆盖自动判定")
+    ep.add_argument("--rollout"), ep.add_argument("--parent")
     sub.add_parser("evals", help="列出已登记评估器")
+    tb = sub.add_parser("tree-begin", help="开一棵发现树（rollout）")
+    tb.add_argument("--archetype", required=True)
+    tb.add_argument("--task", required=True)
+    ta = sub.add_parser("tree-add", help="往发现树挂一个节点（有评估器则自动跑分）")
+    ta.add_argument("--rollout", required=True)
+    ta.add_argument("--archetype", required=True)
+    ta.add_argument("--task", required=True)
+    ta.add_argument("--parent", help="父节点 id，缺省 root")
+    ta.add_argument("--approach"), ta.add_argument("--project"), ta.add_argument("--note")
+    ta.add_argument("--evidence"), ta.add_argument("--cwd")
+    ta.add_argument("--manual", action="store_true", help="强制手动入账（有评估器也不跑）")
+    ta.add_argument("--outcome", choices=["success", "fail", "mixed"])
+    ta.add_argument("--score"), ta.add_argument("--cost"), ta.add_argument("--death")
     args = ap.parse_args()
     return {"init": cmd_init, "log": cmd_log, "query": cmd_query,
             "board": cmd_board, "stats": cmd_stats, "gate": cmd_gate,
-            "eval-set": cmd_evalset, "eval": cmd_eval, "evals": cmd_evals}[args.cmd](args)
+            "eval-set": cmd_evalset, "eval": cmd_eval, "evals": cmd_evals,
+            "tree-begin": cmd_tree_begin, "tree-add": cmd_tree_add}[args.cmd](args)
 
 
 if __name__ == "__main__":

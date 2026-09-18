@@ -24,6 +24,7 @@ description: "回放优先纪律（Dream-RSI 思想内核的提示层落地）�
 
 - 账本位置：`REPLAY_HOME` 或 `~/.replay/ledger.jsonl`；用 `python replay.py`（或已装配的等价入口）调用。
 - 评估器自动化：原型已登记打分器时（`replay evals` 可查），一律用 `replay eval --archetype <原型>` 自动跑分并入账，不准手填分数；未登记评估器又确有价值，可向用户提议 eval-set 登记（改配置先问）。没有客观评估器的任务只记 outcome，不硬造分数。
+- 探索型任务入账时开树：`tree-begin --archetype <原型> --task <任务>` 开 rollout，每次尝试 `tree-add --rollout <id> --parent <父节点id>`（缺省 root，seq 自动）；有评估器时 tree-add 自动跑分。扁平 log 仍用于非探索场景。树形带分数的历史是做梦层的唯一素材——扁平记录进不了回放模拟器。
 - 回放表进对话即可；任务重要时把回放表与本次结果一起存进项目 `docs/task-context/` 或 tmp 档案。
 - 与经验系统的关系：回放管「上次试 X 发生了什么」；经验条目管「下次做 Y 时注意什么」。回放中反复出现的死因，按经验入库四问起草条目，用户确认后入经验库。
 

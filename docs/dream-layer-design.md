@@ -4,7 +4,7 @@
 
 ## 0. 开工前置检查（三条全过才动手）
 
-1. 目标原型 `replay gate` 显示可进化（尝试 ≥8、不同做法 ≥2、带分数 ≥4）；
+1. 目标原型 `replay gate` 显示【可做梦】（树形带分数 ≥4）；只显示【可开树】时，先用 `tree-begin`/`tree-add`（已实现，见 §2）跑树模式探索攒树形历史，攒满再做梦；
 2. 该原型已登记评估器（`replay evals` 可查）——没有分数就没有梦，先补评估器；
 3. 用户已批准本次建设（建新工程 + 后续做梦要花 LLM 调用费，先问）。
 
@@ -40,7 +40,7 @@ ledger.jsonl 不废，记录加字段（旧记录视为无树的扁平尝试，�
 
 - 同一原型下，一次探索任务 = 一棵发现树（rollout id）；节点按 `seq` 定创建顺序（根节点揭示顺序要用）；
 - `score_value` 为数值（评估器分数），无评估器的原型不进树；
-- 新增命令：`replay tree-begin --archetype X`（开树，返回 rollout id）、`replay tree-add --rollout r1 --parent <id> ...`（挂节点，自动 eval 打分入账并挂树）。
+- 新增命令（**已实现，v0.2**）：`replay tree-begin --archetype X --task ...`（开树，返回 rollout id）、`replay tree-add --rollout r1 --parent <id> ...`（挂节点：seq 自动分配、父节点缺省 root、原型有评估器则自动跑分入账并挂树）。扁平 `log`/`eval` 也可用 `--rollout/--parent` 可选字段挂树；不带树字段的旧记录照旧扁平，仅服务小循环回放表，不进回放模拟器。
 
 ## 3. ③ 回放模拟器（replay simulate）
 
