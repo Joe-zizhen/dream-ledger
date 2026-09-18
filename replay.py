@@ -64,7 +64,7 @@ def write_rec(rec):
     # 检测全自动：每次入账当场检查该原型覆盖度，达标即喊（开火与否仍走闸门）
     rs = [r for r in load() if r["archetype"] == rec["archetype"]]
     if not gate_gaps(rs):
-        print("【可进化】原型「%s」覆盖达标（%d 条尝试），值得对它建做梦层——第一次开火先问用户。" % (
+        print("【可进化】原型「%s」覆盖达标（%d 条尝试）——图纸：dream-ledger 仓库 docs/dream-layer-design.md；第一次开火先问用户。" % (
             rec["archetype"], len(rs)))
 
 
@@ -158,7 +158,7 @@ def cmd_gate(_):
         return 0
     for name, rs in sorted(by_a.items()):
         gaps = gate_gaps(rs)
-        verdict = "不可进化（覆盖不足：%s）" % "、".join(gaps) if gaps else "可进化——覆盖达标，值得建做梦层"
+        verdict = "不可进化（覆盖不足：%s）" % "、".join(gaps) if gaps else "可进化——覆盖达标；图纸见 dream-ledger 仓库 docs/dream-layer-design.md"
         print("%s: %s" % (name, verdict))
     return 0
 
